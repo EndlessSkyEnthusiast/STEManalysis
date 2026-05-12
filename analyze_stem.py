@@ -35,7 +35,7 @@ import pandas as pd
 import tifffile
 from PIL import Image
 from scipy import ndimage, signal
-from skimage import color, exposure, filters
+from skimage import color, exposure, feature, filters
 
 TIFF_EXTENSIONS = {".tif", ".tiff"}
 LAYER_ORDER_BOTTOM_TO_TOP = ["Si", "TiN", "TiOxNx", "Au", "W"]
@@ -202,6 +202,8 @@ def parse_stem_filename(filename: str) -> dict[str, Any]:
             parsed["magnification"] = int(float(m.group("mag")))
         elif m := re.fullmatch(r"(?P<px>\d+(?:\.\d+)?)nm", normalized, flags=re.IGNORECASE):
             parsed["pixel_size_nm_from_filename"] = float(m.group("px"))
+        elif m := re.fullmatch(r"(?P<px>\d+(?:\.\d+)?)pm", normalized, flags=re.IGNORECASE):
+            parsed["pixel_size_nm_from_filename"] = float(m.group("px")) / 1000.0
         elif m := re.fullmatch(r"(?P<t>[+\-]?\d+(?:\.\d+)?)deg", normalized, flags=re.IGNORECASE):
             parsed["tilt_deg"] = float(m.group("t"))
         elif token not in {parts[0]}:
@@ -300,12 +302,40 @@ def detect_red_marker_image(image: np.ndarray, threshold: float = 0.001) -> dict
     return {"has_red_marker": fraction > threshold, "red_pixel_fraction": fraction, "threshold": threshold, "method": "rgb_threshold"}
 
 
-def detect_and_crop_databar(image: np.ndarray, metadata: dict[str, Any], crop_bottom: int | None = None, crop: tuple[int, int, int, int] | None = None) -> DatabarCropResult:
+def _target_databar_color_mask(rgb: np.ndarray, tolerance: float = 2.0) -> np.ndarray:
+    """Return pixels matching the known STEM databar palette."""
+
+    if rgb.max() <= 1.0:
+        rgb = rgb * 255.0
+    rgb = rgb[..., :3].astype(np.float32)
+    palette = np.asarray(
+        [
+            [0x2E, 0x2E, 0x2E],
+            [0x8C, 0xC9, 0xE7],
+            [0xFF, 0xFF, 0xFF],
+        ],
+        dtype=np.float32,
+    )
+    distances = np.max(np.abs(rgb[:, :, None, :] - palette[None, None, :, :]), axis=-1)
+    return np.min(distances, axis=-1) <= tolerance
+
+
+def detect_and_crop_databar(
+    image: np.ndarray,
+    metadata: dict[str, Any],
+    crop_bottom: int | None = None,
+    crop: tuple[int, int, int, int] | None = None,
+    color_image: np.ndarray | None = None,
+    databar_palette_fraction: float = 0.95,
+) -> DatabarCropResult:
     """Detect and remove the bottom acquisition databar/infobox.
 
     Manual ``--crop`` has highest priority, followed by ``--crop-bottom``. The
-    automatic fallback looks for a strong horizontal change in row statistics in
-    the lower half of the image and is intentionally conservative.
+    automatic detector first searches for the uppermost row whose pixels are at
+    least 95% drawn from the known databar palette (#2e2e2e, #8cc9e7, #ffffff).
+    This directly identifies the top edge of the databar instead of guessing from
+    generic bottom-image statistics. If no RGB palette row is available, the
+    older row-statistic detector remains as a conservative fallback.
     """
 
     height, width = image.shape[:2]
@@ -315,6 +345,30 @@ def detect_and_crop_databar(image: np.ndarray, metadata: dict[str, Any], crop_bo
     if crop_bottom is not None:
         y = int(np.clip(crop_bottom, 1, height))
         return DatabarCropResult(image[:y, :], (0, 0, width, y), y, "manual_crop_bottom", 1.0, {})
+
+    if color_image is not None and color_image.ndim == 3 and color_image.shape[-1] >= 3:
+        rgb = color_image[..., :3]
+        if rgb.shape[:2] == image.shape[:2]:
+            palette_mask = _target_databar_color_mask(rgb)
+            row_fraction = np.mean(palette_mask, axis=1)
+            candidates = np.flatnonzero(row_fraction >= databar_palette_fraction)
+            if candidates.size:
+                candidate = int(candidates[0])
+                confidence = float(row_fraction[candidate])
+                diagnostics = {
+                    "target_palette_hex": ["#2e2e2e", "#8cc9e7", "#ffffff"],
+                    "row_palette_fraction": row_fraction.tolist(),
+                    "threshold_fraction": databar_palette_fraction,
+                    "matched_rows": int(candidates.size),
+                }
+                return DatabarCropResult(
+                    image[:candidate, :],
+                    (0, 0, width, candidate),
+                    candidate,
+                    "auto_databar_palette_top_row",
+                    confidence,
+                    diagnostics,
+                )
 
     # Metadata fallback: if ImageLength/Page shape suggests a smaller true data
     # region than the loaded raster, use it. This is rare but robust when present.
@@ -342,7 +396,7 @@ def detect_and_crop_databar(image: np.ndarray, metadata: dict[str, Any], crop_bo
         candidate = height
         method = "auto_none_low_confidence"
     else:
-        method = "auto_row_stat_change"
+        method = "auto_row_stat_change_fallback"
     diagnostics = {"row_mean": row_mean.tolist(), "row_std": row_std.tolist(), "score_max": float(score[candidate - 1 if candidate == height else candidate])}
     return DatabarCropResult(image[:candidate, :], (0, 0, width, candidate), candidate, method, confidence, diagnostics)
 
@@ -382,8 +436,38 @@ def detect_valid_image_region(image: np.ndarray, apply_crop: bool = False) -> Va
     return ValidRegionResult((x0, 0, x1, h), candidates, warnings_list, {"col_mean": col_mean.tolist(), "col_var": col_var.tolist(), "edge_score": score.tolist()})
 
 
+def _find_nonblack_content_start(image: np.ndarray) -> int:
+    """Find the first row containing real sample signal above a top black void."""
+
+    h = image.shape[0]
+    if h == 0:
+        return 0
+    row_median = np.median(image, axis=1)
+    row_std = np.std(image, axis=1)
+    dynamic = float(np.percentile(image, 99.0) - np.percentile(image, 1.0))
+    black_level = float(np.percentile(image, 1.0) + max(dynamic * 0.03, 1e-6))
+    texture_level = float(max(np.percentile(row_std, 75.0) * 0.05, 1e-6))
+    void_rows = (row_median <= black_level) & (row_std <= texture_level)
+    first_content = 0
+    for y in range(h):
+        if not void_rows[y]:
+            first_content = y
+            break
+    else:
+        return 0
+    # Require that the void touches the top and is not just a dark line.
+    if first_content >= max(5, int(0.01 * h)) and np.all(void_rows[:first_content]):
+        return int(first_content)
+    return 0
+
+
 def estimate_layer_boundaries(image: np.ndarray, layer_json: Path | None = None) -> LayerResult:
-    """Estimate coarse horizontal layer boundaries or load manual JSON layers."""
+    """Estimate coarse horizontal layer boundaries or load manual JSON layers.
+
+    The automatic path uses a standard Canny/Sobel-style edge workflow: ignore a
+    continuous black top void, detect edges, collapse horizontal edge evidence by
+    image row, and pick prominent row peaks as layer-interface candidates.
+    """
 
     h, _w = image.shape[:2]
     warnings_list: list[str] = []
@@ -393,27 +477,58 @@ def estimate_layer_boundaries(image: np.ndarray, layer_json: Path | None = None)
         boundaries = sorted({v["y_min"] for v in layers.values()} | {v["y_max"] for v in layers.values() if v["y_max"] < h})
         return LayerResult(boundaries, layers, "manual_json", warnings_list, {"source": str(layer_json)})
 
+    if h < 3 or image.size == 0:
+        warnings_list.append("Automatic layer detection is uncertain because the image is too small.")
+        return LayerResult([], {}, "auto_canny_sobel_edge", warnings_list, {})
+
+    content_start = _find_nonblack_content_start(image)
+    work = image[content_start:, :]
+    if content_start:
+        warnings_list.append(f"Ignored top black void from y=0 to y={content_start} px for layer detection.")
+    if work.shape[0] < 3:
+        warnings_list.append("Automatic layer detection is uncertain after removing the top black void.")
+        return LayerResult([], {}, "auto_canny_sobel_edge", warnings_list, {"content_start_px": content_start})
+
     row_mean = np.mean(image, axis=1)
     row_median = np.median(image, axis=1)
     row_std = np.std(image, axis=1)
-    sigma = max(2, h / 250)
-    smooth = ndimage.gaussian_filter1d(row_median, sigma=sigma)
-    gradient = np.gradient(smooth)
-    prominence = max(np.std(gradient) * 1.5, 1e-9)
-    peaks_pos, _ = signal.find_peaks(np.abs(gradient), distance=max(10, h // 25), prominence=prominence)
-    ranked = sorted(peaks_pos, key=lambda y: abs(gradient[y]), reverse=True)[:4]
-    boundaries = sorted(int(y) for y in ranked)
+    work_norm = exposure.rescale_intensity(work.astype(np.float32), in_range="image", out_range=(0.0, 1.0))
+    work_smooth = filters.gaussian(work_norm, sigma=1.0, preserve_range=True)
+    canny_edges = feature.canny(work_smooth, sigma=1.5)
+    horizontal_sobel = np.abs(filters.sobel_h(work_smooth))
+    edge_density = np.mean(canny_edges, axis=1)
+    sobel_score = np.mean(horizontal_sobel, axis=1)
+    combined = edge_density / (np.std(edge_density) + 1e-9) + sobel_score / (np.std(sobel_score) + 1e-9)
+    combined = ndimage.gaussian_filter1d(combined, sigma=max(1.0, work.shape[0] / 300))
+
+    distance = max(8, work.shape[0] // 30)
+    prominence = max(float(np.std(combined) * 0.8), 1e-9)
+    peaks, props = signal.find_peaks(combined, distance=distance, prominence=prominence)
+    ranked = sorted(peaks, key=lambda y: combined[y], reverse=True)[:4]
+    boundaries = sorted(int(y + content_start) for y in ranked if 0 < y + content_start < h)
+
     if len(boundaries) < 2:
-        warnings_list.append("Automatic layer detection is uncertain; use --layer-json for quantitative thicknesses.")
-    intervals = [0] + boundaries + [h]
+        warnings_list.append("Automatic edge-based layer detection is uncertain; use --layer-json for quantitative thicknesses.")
+
+    intervals = [content_start] + boundaries + [h]
+    interval_pairs = [(y0, y1) for y0, y1 in zip(intervals[:-1], intervals[1:]) if y1 > y0]
+    top_to_bottom_labels = list(reversed(LAYER_ORDER_BOTTOM_TO_TOP))
+    labels = top_to_bottom_labels[-len(interval_pairs) :] if len(interval_pairs) > len(top_to_bottom_labels) else top_to_bottom_labels[: len(interval_pairs)]
     layers: dict[str, dict[str, int]] = {}
-    # Assign bottom-to-top labels to available intervals as a diagnostic proposal.
-    interval_pairs = list(zip(intervals[:-1], intervals[1:]))
-    labels = LAYER_ORDER_BOTTOM_TO_TOP[-len(interval_pairs) :]
-    for label, (y0, y1) in zip(reversed(labels), interval_pairs):
+    for label, (y0, y1) in zip(labels, interval_pairs):
         layers[label] = {"y_min": int(y0), "y_max": int(y1)}
-    diagnostics = {"row_mean": row_mean.tolist(), "row_median": row_median.tolist(), "row_std": row_std.tolist(), "gradient": gradient.tolist()}
-    return LayerResult(boundaries, layers, "auto_candidate", warnings_list, diagnostics)
+
+    diagnostics = {
+        "content_start_px": content_start,
+        "row_mean": row_mean.tolist(),
+        "row_median": row_median.tolist(),
+        "row_std": row_std.tolist(),
+        "canny_edge_density": np.pad(edge_density, (content_start, 0), constant_values=np.nan).tolist(),
+        "horizontal_sobel_score": np.pad(sobel_score, (content_start, 0), constant_values=np.nan).tolist(),
+        "edge_score": np.pad(combined, (content_start, 0), constant_values=np.nan).tolist(),
+        "peak_prominences": props.get("prominences", np.array([])).tolist(),
+    }
+    return LayerResult(boundaries, layers, "auto_canny_sobel_edge", warnings_list, diagnostics)
 
 
 def write_layer_template(path: Path, image_height: int, boundaries: Iterable[int]) -> None:
@@ -467,8 +582,8 @@ def compute_sliding_fft_grain_metrics(
     image: np.ndarray,
     layer_roi: tuple[int, int, int, int],
     pixel_size_nm: float,
-    stripe_height_px: int = 32,
-    stripe_step_px: int = 16,
+    stripe_height_px: int = 4,
+    stripe_step_px: int = 1,
     min_period_nm: float = 5.0,
     max_period_nm: float = 500.0,
     detrend_profile: bool = True,
@@ -491,6 +606,7 @@ def compute_sliding_fft_grain_metrics(
     if stripe_height_px > roi_img.shape[0]:
         stripe_height_px = max(2, roi_img.shape[0])
         warnings_list.append("Stripe height reduced because ROI is shallow.")
+    stripe_step_px = max(1, int(stripe_step_px))
     win = signal.get_window(window, roi_img.shape[1]) if window else np.ones(roi_img.shape[1])
     freqs = np.fft.rfftfreq(roi_img.shape[1], d=pixel_size_nm)
     valid = freqs > 0
@@ -729,7 +845,7 @@ def analyze_one_image(path: Path, args: argparse.Namespace, index_row_update: di
             write_json(out_dir / "analysis_summary.json", summary)
             return summary
 
-    databar = detect_and_crop_databar(load.gray, load.metadata, args.crop_bottom, args.crop)
+    databar = detect_and_crop_databar(load.gray, load.metadata, args.crop_bottom, args.crop, color_image=load.original)
     valid = detect_valid_image_region(databar.cropped, apply_crop=False)
     warnings_list.extend(valid.warnings)
 
@@ -820,7 +936,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze STEM cross-section TIFF images with diagnostics and sliding FFT metrics.")
     parser.add_argument("--root", type=Path, default=Path("."), help="Root folder containing sample subfolders.")
     parser.add_argument("--sample", default="#1_550C_50min", help="Sample folder for single-image mode.")
-    parser.add_argument("--file", default="1_20260306_2_30.00kV_1.6nA_STEM3+_BF_30.00µs_5.1mm_2.12µm_60000×_1.38nm_38.0deg.tif", help="Filename for single-image mode.")
+    parser.add_argument("--file", default="1_20260306_14_30.00kV_0.10nA_STEM3+_DF3_30.00µs_5.1mm_1.06µm_120000×_689pm_38.0deg.tif", help="Filename for single-image mode.")
     parser.add_argument("--out", type=Path, default=Path("results"), help="Output results directory.")
     parser.add_argument("--analyze-all", action="store_true", help="Analyze all indexed TIFFs after optional filters.")
     parser.add_argument("--skip-red-marker", action="store_true", help="Skip RGB images with red annotation markers.")
@@ -829,8 +945,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer-json", type=Path, default=None, help="Manual editable layer JSON path.")
     parser.add_argument("--write-layer-template", action="store_true", help="Write editable layer_template.json in the image result folder.")
     parser.add_argument("--fft-roi", type=parse_crop_arg, default=None, help="FFT ROI x0,y0,x1,y1 in databar-cropped image coordinates.")
-    parser.add_argument("--stripe-height", type=int, default=32, help="Sliding FFT stripe height in pixels.")
-    parser.add_argument("--stripe-step", type=int, default=16, help="Sliding FFT stripe step in pixels.")
+    parser.add_argument("--stripe-height", type=int, default=4, help="Sliding FFT stripe height in pixels.")
+    parser.add_argument("--stripe-step", type=int, default=1, help="Sliding FFT stripe step in pixels; default 1 gives a wandering 4-row field (1-4, 2-5, 3-6, ...).")
     parser.add_argument("--min-period-nm", type=float, default=5.0, help="Minimum FFT period to evaluate in nm.")
     parser.add_argument("--max-period-nm", type=float, default=500.0, help="Maximum FFT period to evaluate in nm.")
     parser.add_argument("--mode-filter", default=None, help="Batch mode filter, e.g. BF.")
